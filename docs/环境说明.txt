@@ -1,0 +1,51 @@
+考公 RAG 环境说明
+日期：2026-11-19
+依据：docs/PRD.md。本次仅配置环境，不实现业务代码。
+
+运行基线：Windows x64，CPython 3.13.5；项目限制 Python >=3.13,<3.14。
+uv 0.13.9 安装在项目 .tools/uv-package/bin/uv.exe，不依赖全局 PATH。
+PyCharm 解释器：D:\KaoGongRAG\.venv\Scripts\python.exe
+
+在项目根目录 PowerShell 执行：
+  ./uv.ps1 sync --locked
+  ./uv.ps1 run python main.py
+  ./uv.ps1 pip check
+生产环境仅安装运行依赖：
+  ./uv.ps1 sync --locked --no-dev
+安装开发依赖恢复开发环境：
+  ./uv.ps1 sync --locked
+
+镜像：pyproject.toml 将清华 https://pypi.tuna.tsinghua.edu.cn/simple 配为默认源。
+uv.ps1 临时设置 NO_PROXY=*，避免关闭 Clash 后残留代理影响下载，退出恢复原值。
+已实际使用直连完成下载；镜像仍需要网络，不是离线安装。
+配置依据：https://docs.astral.sh/uv/concepts/indexes/
+
+requirements.txt 是从 uv.lock 导出的生产依赖，包含精确版本与哈希、不含开发组。
+重新导出：
+  ./uv.ps1 export --locked --no-dev --no-emit-project --format requirements-txt --output-file requirements.txt
+使用 pip 的部署方式（预先安装 Python 3.13）：
+  python -m pip install --require-hashes -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+pip 不读取 pyproject.toml 的 uv 镜像配置；关闭 Clash 后如有残留代理需清理或设置 NO_PROXY。
+Linux 已安装 uv 时使用 uv sync --locked --no-dev；本地 PowerShell 包装器只用于 Windows。
+新电脑需先安装 uv，或使用已有 Python 从镜像安装项目本地 uv：
+  python -m pip install uv==0.13.9 --target .tools/uv-package -i https://pypi.tuna.tsinghua.edu.cn/simple
+Python 解释器下载不受 PyPI 镜像配置控制，建议提前安装 Python 3.13.5。
+
+依赖范围：FastAPI/Uvicorn、Pydantic、SQLAlchemy/Alembic、psycopg binary/pool、
+LangChain/LangGraph/Postgres checkpoint、PyMilvus 2.6、HTTPX、pypdf。
+开发组：pytest、pytest-asyncio、ruff。实际精确版本以 uv.lock 为准。
+已按用户要求安装 DashScope 2.1.0，并通过导入及依赖兼容检查；尚未配置密钥或验证 API 调用。
+已补充 OpenAI Python SDK 3.55.1，密钥及 API 联调留待配置。
+已补充 tqdm 4.70.1、Pillow 13.0.0（import PIL）、PyMuPDF 2.1（提供 fitz）。
+已通过进度迭代、Pillow 图像创建、PDF 内存创建和重新读取及依赖兼容检查。
+当前 PyMuPDF 对 import fitz 提示弃用，新代码建议 import pymupdf 或 import pymupdf as fitz。
+PyMuPDF 的传递依赖包含 pymupdf-layout、pymupdf4llm、onnxruntime，具体版本见 uv.lock。
+具体 OCR/Embedding/LLM 模型待确定，未配置模型或 GPU 运行环境。
+PostgreSQL 和 Milvus 为独立服务，安装 Python SDK 不代表已部署服务。
+Milvus 服务端版本需与 SDK 2.6 系列核对并联调；不要默认使用 Milvus Lite。
+数据库连接、迁移、checkpoint 建表、外部 API 凭据和业务验收留待实现阶段。
+Windows 下若使用 psycopg 异步连接，需关注 SelectorEventLoop 配置并进行联调。
+
+验证边界：已完成 Windows 本机依赖解析、安装及 uv pip check。
+跨平台锁文件不等于 Linux 生产运行验证；生产镜像仍须执行安装与服务集成测试。
+更新依赖后应重新锁定、同步、导出并重跑验证。不要手工修改 requirements.txt。

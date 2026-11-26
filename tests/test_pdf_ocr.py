@@ -2,7 +2,7 @@ import base64
 import io
 import json
 
-import httpx
+import httpx2 as httpx
 import pymupdf
 import pytest
 from PIL import Image
@@ -29,7 +29,7 @@ def test_null_choice_is_sanitized():
     with (
         httpx.Client(
             transport=httpx.MockTransport(
-                lambda _: httpx.Response(200, json={"output": {"choices": [None]}})
+                lambda _: httpx.Response(200, json={"choices": [None]})
             )
         ) as http,
         pytest.raises(OCRError),
@@ -184,7 +184,11 @@ def test_cli_exit_codes(tmp_path, monkeypatch, status, expected):
     import main
 
     monkeypatch.setenv("OCR_API_KEY", "test-key")
-    monkeypatch.setattr(main, "convert_pdf", lambda *a, **kw: {"status": status})
+
+    async def fake_convert(*a, **kw):
+        return {"status": status}
+
+    monkeypatch.setattr(main, "convert_pdf_async", fake_convert)
     assert (
         main.main(["unused.pdf", "--env-file", str(tmp_path / "missing.env")])
         == expected
@@ -204,67 +208,52 @@ def settings(**kwargs):
     return Settings(_env_file=None, ocr_api_key="test-key", **kwargs)
 
 
+def completion(text='{"blocks": []}', reason="stop"):
+    return {
+        "id": "test",
+        "object": "chat.completion",
+        "created": 0,
+        "model": "qwen3-vl-plus",
+        "choices": [
+            {
+                "index": 0,
+                "finish_reason": reason,
+                "message": {"role": "assistant", "content": text},
+            }
+        ],
+    }
+
+
 def test_http_retry_and_schema():
     requests = []
 
     def handler(request):
         requests.append(request)
-        if len(requests) == 1:
-            return httpx.Response(503)
-        return httpx.Response(
-            200,
-            json={
-                "output": {
-                    "choices": [
-                        {
-                            "finish_reason": "stop",
-                            "message": {"content": [{"text": '{"blocks": []}'}]},
-                        }
-                    ]
-                }
-            },
+        return (
+            httpx.Response(503)
+            if len(requests) == 1
+            else httpx.Response(200, json=completion())
         )
 
     with httpx.Client(transport=httpx.MockTransport(handler)) as http:
         client = OCRClient(settings(ocr_retries=1), http=http, sleep=lambda _: None)
         assert client.recognize(page_png()).blocks == []
     body = json.loads(requests[-1].content)
-    assert body["input"]["messages"][0]["content"][0]["image"].startswith(
+    assert body["messages"][0]["content"][0]["image_url"]["url"].startswith(
         "data:image/png;base64,"
     )
+    assert requests[-1].url.path.endswith("/compatible-mode/v1/chat/completions")
     assert requests[-1].headers["authorization"] == "Bearer test-key"
+    assert len(requests) == 2
 
 
 @pytest.mark.parametrize(
     "response",
     [
         httpx.Response(401, text="secret should not be logged"),
-        httpx.Response(
-            200,
-            json={
-                "output": {
-                    "choices": [
-                        {
-                            "finish_reason": "length",
-                            "message": {"content": [{"text": '{"blocks": []}'}]},
-                        }
-                    ]
-                }
-            },
-        ),
-        httpx.Response(
-            200,
-            json={
-                "output": {
-                    "choices": [
-                        {
-                            "finish_reason": "stop",
-                            "message": {"content": [{"text": "not JSON"}]},
-                        }
-                    ]
-                }
-            },
-        ),
+        httpx.Response(200, json=completion(reason="length")),
+        httpx.Response(200, json=completion(text="not JSON")),
+        httpx.Response(200, json=completion(text=None)),
     ],
 )
 def test_bad_response_is_not_success(response):

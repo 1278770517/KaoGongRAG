@@ -1,10 +1,13 @@
+from .async_converter import convert_pdf_async
+
+__all__ = ["convert_pdf", "convert_pdf_async"]
 import hashlib
 import json
 from pathlib import Path
 from typing import Protocol
 
-import httpx
 import pymupdf
+from openai import AsyncOpenAI
 
 from pdf_ocr.client import OCRError
 from pdf_ocr.layout import Layout, render_markdown
@@ -15,6 +18,7 @@ class Recognizer(Protocol):
 
 
 def write_json(path: Path, value: dict):
+    # 先写入临时文件再替换，读取方不会遇到只写了一半的 JSON。
     temporary = path.with_suffix(".json.tmp")
     temporary.write_text(
         json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -22,6 +26,7 @@ def write_json(path: Path, value: dict):
     temporary.replace(path)
 
 
+# 同步兼容入口，按页依次渲染、识别并保存。
 def convert_pdf(
     source: Path,
     output: Path,
@@ -97,24 +102,38 @@ def convert_pdf(
         )
         write_json(root / "manifest.json", manifest)
         return manifest
-if __name__ == '__main__':
+
+
+async def _example():
+    from pdf_ocr.client import AsyncOCRClient
     from pdf_ocr.config import Settings
-    from pdf_ocr.client import OCRClient
-    from pdf_ocr.converter import convert_pdf
+
     settings = Settings()
 
-    with httpx.Client() as http:
+    async with AsyncOpenAI(
+        api_key=settings.ocr_api_key.get_secret_value(),
+        base_url=settings.ocr_base_url,
+        max_retries=0,
+        timeout=settings.ocr_timeout,
+    ) as sdk:
         # 创建 OCR 模型客户端
-        client = OCRClient(settings, http=http)
+        client = AsyncOCRClient(settings, sdk=sdk)
 
         # 逐页识别并保存 Markdown
-        result = convert_pdf(
-            source="D:\KaoGongRAG\Test.pdf",
-            output="D:\KaoGongRAG\output",
+        result = await convert_pdf_async(
+            source=r"D:\KaoGongRAG\2023公考公基常识必刷600题-解析册_第2-100页.pdf",
+            output=r"D:\KaoGongRAG\output",
             client=client,
             start_page=1,
-            end_page=None,  # None 表示处理到最后一页
+            end_page=5,  # None 表示处理到最后一页
             dpi=settings.ocr_dpi,
+            concurrency=settings.ocr_concurrency,
         )
 
     print(result["status"])
+
+
+if __name__ == "__main__":
+    import asyncio
+
+    asyncio.run(_example())

@@ -36,6 +36,7 @@ class Layout(BaseModel):
 
 def parse_layout(text: str) -> Layout:
     text = text.strip()
+    # 兼容模型在 JSON 外层加 Markdown 代码围栏的情况。
     if text.startswith(("```json\n", "```\n")):
         if not text.endswith("```"):
             raise ValueError("Unclosed JSON fence")
@@ -46,11 +47,13 @@ def parse_layout(text: str) -> Layout:
 def render_markdown(layout: Layout, png: bytes) -> str:
     parts = []
     with Image.open(io.BytesIO(png)) as page:
+        # 按模型给出的阅读顺序遍历，插图保留在相邻正文之间。
         for block in layout.blocks:
             if isinstance(block, TextBlock):
                 parts.append(block.markdown.strip())
                 continue
             x1, y1, x2, y2 = block.bbox
+            # 将 0–1000 的归一化坐标换算成像素，向外取整以保留边缘。
             bounds = (
                 math.floor(x1 * page.width / 1000),
                 math.floor(y1 * page.height / 1000),
@@ -59,6 +62,7 @@ def render_markdown(layout: Layout, png: bytes) -> str:
             )
             image = io.BytesIO()
             page.crop(bounds).save(image, format="PNG")
+            # 用 data URL 将裁出的 PNG 直接写入 Markdown。
             encoded = base64.b64encode(image.getvalue()).decode("ascii")
             alt = (
                 block.alt.replace("\\", "\\\\")

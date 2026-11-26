@@ -18,7 +18,7 @@ Copy-Item .env.example .env
 ./.venv/Scripts/python.exe main.py "试卷.pdf" --start-page 2 --end-page 5
 ```
 
-现有脚本配置已迁移至忽略的 `.env`。环境变量优先于 `.env`；`--env-file` 可指定配置文件。密钥不得提交。`OCR_BASE_URL` 使用 DashScope 原生 `/api/v1` 地址，不是 OpenAI compatible-mode 地址。
+现有脚本配置已迁移至忽略的 `.env`。环境变量优先于 `.env`；`--env-file` 可指定配置文件。密钥不得提交。`OCR_BASE_URL` 使用 OpenAI 兼容接口地址，当前为 `https://ws-nzz9m16u7c5um2ek.cn-beijing.maas.aliyuncs.com/compatible-mode/v1`。调用通过 `OpenAI(...).chat.completions.create(...)` 完成；不要填写原生 `/api/v1` 地址。
 
 输出为 `output/试卷/1/1.md`、`output/试卷/2/2.md` 等。每个页目录还保存 `page.png` 和 `layout.json` 供核对，文件名目录下保存 `manifest.json` 汇总状态。布局图片坐标归一化为 0–1000。
 
@@ -36,7 +36,7 @@ Markdown 图片形如 `![图片](data:image/png;base64,...)`，不依赖外部�
 
 这能防止程序拼接导致乱序，但 OCR 仍可能漏字、错判分栏或图片边界，无法承诺所有版面自动正确。复杂题库请对照 page.png 和 layout.json 抽查。目标是阅读顺序，不是原版式复刻。合并单元格等复杂表格在 Markdown 中表达有限。PDF 页面会发送至 `.env` 配置的 OCR 服务。
 
-接口依据：[阿里云 Qwen OCR 官方文档](https://www.alibabacloud.com/help/en/model-studio/qwen-vl-ocr-api-reference)。未设置内置 ocr_options，以免固定任务覆盖布局提示词。
+接口依据：[阿里云 Qwen OCR 官方文档](https://www.alibabacloud.com/help/en/model-studio/qwen-vl-ocr-api-reference)。通过 OpenAI SDK 发送 image_url 与布局提示词，读取 choices[0].message.content。SDK 内置重试关闭，统一由 OCR_RETRIES 控制网络和布局错误的重试次数。
 
 ## 验证
 
@@ -44,3 +44,25 @@ Markdown 图片形如 `![图片](data:image/png;base64,...)`，不依赖外部�
 ./.venv/Scripts/python.exe -m pytest -q
 ./.venv/Scripts/python.exe -m ruff check main.py pdf_ocr tests
 ```
+
+## 异步调用
+
+CLI 现在使用 AsyncOpenAI 和 convert_pdf_async，.env 的 OCR_CONCURRENCY 默认 3（范围 1–16）。按有限批次并发识别，页图内存随并发数而非总页数增长。渲染、哈希、裁图和磁盘写入在后台串行执行，API 请求及重试等待不阻塞事件循环。完成日志可能乱序，但目录与 manifest 始终按原页码对应。
+
+```python
+from pathlib import Path
+from openai import AsyncOpenAI
+from pdf_ocr.config import Settings
+from pdf_ocr.client import AsyncOCRClient
+from pdf_ocr.converter import convert_pdf_async
+
+async def convert():
+    settings = Settings()
+    async with AsyncOpenAI(api_key=settings.ocr_api_key.get_secret_value(),
+                           base_url=settings.ocr_base_url, max_retries=0) as sdk:
+        return await convert_pdf_async(
+            Path("试卷.pdf"), Path("output"), AsyncOCRClient(settings, sdk=sdk),
+            concurrency=settings.ocr_concurrency, dpi=settings.ocr_dpi)
+```
+
+在已有异步服务中直接 `await convert()`；普通脚本用 `asyncio.run(convert())`。原 convert_pdf/OCRClient 保留为同步兼容接口。异步不是持久任务队列；请求需要立即返回任务 ID 时仍需额外任务系统。取消时停止调度剩余页，已保存结果保留，manifest 不会误标为完成。

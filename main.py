@@ -1,16 +1,17 @@
 import argparse
+import asyncio
 import sys
 from pathlib import Path
 
-import httpx
+from openai import AsyncOpenAI
 from pydantic import ValidationError
 
-from pdf_ocr.client import OCRClient
+from pdf_ocr.client import AsyncOCRClient
 from pdf_ocr.config import Settings
-from pdf_ocr.converter import convert_pdf
+from pdf_ocr.converter import convert_pdf_async
 
 
-def main(argv=None) -> int:
+async def async_main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description="逐页 OCR 解析 PDF，图片以 Base64 内嵌 Markdown"
     )
@@ -26,14 +27,21 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     try:
         settings = Settings(_env_file=args.env_file)
-        with httpx.Client(follow_redirects=False) as http:
-            result = convert_pdf(
+        # 一次转换共用一个异步客户端，退出上下文时关闭连接。
+        async with AsyncOpenAI(
+            api_key=settings.ocr_api_key.get_secret_value(),
+            base_url=settings.ocr_base_url,
+            timeout=settings.ocr_timeout,
+            max_retries=0,
+        ) as sdk:
+            result = await convert_pdf_async(
                 args.pdf,
                 args.output,
-                OCRClient(settings, http=http),
+                AsyncOCRClient(settings, sdk=sdk),
                 start_page=args.start_page,
                 end_page=args.end_page,
                 dpi=settings.ocr_dpi,
+                concurrency=settings.ocr_concurrency,
                 progress=lambda page, last, status: print(
                     f"[{page}/{last}] {status}", flush=True
                 ),
@@ -52,6 +60,11 @@ def main(argv=None) -> int:
         return 2
     print(f"结果目录：{(args.output / args.pdf.stem).resolve()}")
     return 0 if result["status"] == "completed" else 1
+
+
+def main(argv=None):
+    # 为命令行创建事件循环，等待转换结束后返回退出码。
+    return asyncio.run(async_main(argv))
 
 
 if __name__ == "__main__":

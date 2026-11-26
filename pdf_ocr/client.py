@@ -1,7 +1,14 @@
+import asyncio
 import base64
 import time
 
-import httpx
+from openai import (
+    APIConnectionError,
+    APIResponseValidationError,
+    APIStatusError,
+    AsyncOpenAI,
+    OpenAI,
+)
 
 from .config import Settings
 from .layout import Layout, parse_layout
@@ -30,73 +37,157 @@ class OCRError(RuntimeError):
 
 
 class OCRClient:
-    def __init__(self, settings: Settings, *, http: httpx.Client, sleep=time.sleep):
+    def __init__(self, settings: Settings, *, sdk=None, http=None, sleep=time.sleep):
         self.settings = settings
-        self.http = http
+        self.sdk = (
+            sdk
+            if sdk is not None
+            else OpenAI(
+                api_key=settings.ocr_api_key.get_secret_value(),
+                base_url=settings.ocr_base_url,
+                timeout=settings.ocr_timeout,
+                max_retries=0,
+                http_client=http,
+            )
+        )
         self.sleep = sleep
 
+    # 同步入口供已有调用方使用，仍沿用相同的布局校验和重试规则。
     def recognize(self, png: bytes) -> Layout:
         settings = self.settings
-        body = {
-            "model": settings.ocr_model,
-            "input": {
-                "messages": [
+        messages = [
+            {
+                "role": "user",
+                "content": [
                     {
-                        "role": "user",
-                        "content": [
-                            {
-                                "image": "data:image/png;base64,"
-                                + base64.b64encode(png).decode("ascii")
-                            },
-                            {"text": PROMPT},
-                        ],
-                    }
-                ]
-            },
-            "parameters": {"temperature": 0, "max_tokens": settings.ocr_max_tokens},
-        }
+                        "type": "image_url",
+                        "image_url": {
+                            "url": "data:image/png;base64,"
+                            + base64.b64encode(png).decode("ascii")
+                        },
+                    },
+                    {"type": "text", "text": PROMPT},
+                ],
+            }
+        ]
+        # 网络错误和布局校验失败共用重试次数，SDK 内置重试已关闭。
         for attempt in range(settings.ocr_retries + 1):
             try:
-                response = self.http.post(
-                    settings.ocr_base_url
-                    + "/services/aigc/multimodal-generation/generation",
-                    headers={
-                        "Authorization": "Bearer "
-                        + settings.ocr_api_key.get_secret_value()
-                    },
-                    json=body,
+                response = self.sdk.with_options(max_retries=0).chat.completions.create(
+                    model=settings.ocr_model,
+                    messages=messages,
+                    temperature=0,
+                    max_tokens=settings.ocr_max_tokens,
                     timeout=settings.ocr_timeout,
                 )
-            except httpx.TransportError:
+                choice = response.choices[0]
+                if choice.finish_reason != "stop":
+                    raise OCRError(
+                        "OCR 输出未正常结束，可能截断；请检查 OCR_MAX_TOKENS"
+                    )
+                if not isinstance(choice.message.content, str):
+                    raise TypeError("Missing OCR text")
+                return parse_layout(choice.message.content)
+            except APIConnectionError:
                 error = OCRError("OCR 网络连接失败或超时")
-            else:
-                if response.status_code == 200:
-                    try:
-                        choice = response.json()["output"]["choices"][0]
-                        if not isinstance(choice, dict):
-                            raise TypeError("Invalid OCR choice")
-                        if choice.get("finish_reason") != "stop":
-                            raise OCRError(
-                                "OCR 输出未正常结束，可能截断；请提高 OCR_MAX_TOKENS"
-                            )
-                        text = "".join(
-                            item["text"] for item in choice["message"]["content"]
-                        )
-                        return parse_layout(text)
-                    except OCRError as exc:
-                        error = exc
-                    except (ValueError, KeyError, IndexError, TypeError):
-                        error = OCRError(
-                            "OCR 返回的布局 JSON 无效，请检查模型是否支持结构化识别"
-                        )
-                else:
-                    error = OCRError(f"OCR HTTP {response.status_code}")
-                    if (
-                        response.status_code not in (408, 429)
-                        and response.status_code < 500
-                    ):
-                        raise error
+            except APIStatusError as exc:
+                error = OCRError(f"OCR HTTP {exc.status_code}")
+                if exc.status_code not in (408, 429) and exc.status_code < 500:
+                    raise error from None
+            except OCRError as exc:
+                error = exc
+            except (
+                APIResponseValidationError,
+                ValueError,
+                KeyError,
+                IndexError,
+                TypeError,
+                AttributeError,
+            ):
+                error = OCRError(
+                    "OCR 返回的布局 JSON 无效，请检查模型是否支持结构化识别"
+                )
             if attempt == settings.ocr_retries:
                 raise error from None
             self.sleep(min(2**attempt, 8))
+        raise AssertionError("unreachable")
+
+
+class AsyncOCRClient:
+    def __init__(self, settings: Settings, *, sdk=None, http=None, sleep=asyncio.sleep):
+        self.settings = settings
+        self.sdk = (
+            sdk
+            if sdk is not None
+            else AsyncOpenAI(
+                api_key=settings.ocr_api_key.get_secret_value(),
+                base_url=settings.ocr_base_url,
+                timeout=settings.ocr_timeout,
+                max_retries=0,
+                http_client=http,
+            )
+        )
+        self.sleep = sleep
+
+    # 把单页 PNG 作为图像输入，等待模型返回按阅读顺序排列的布局块。
+    async def recognize(self, png: bytes) -> Layout:
+        settings = self.settings
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": "data:image/png;base64,"
+                            + base64.b64encode(png).decode("ascii")
+                        },
+                    },
+                    {"type": "text", "text": PROMPT},
+                ],
+            }
+        ]
+        # 网络错误和布局校验失败共用重试次数，SDK 内置重试已关闭。
+        for attempt in range(settings.ocr_retries + 1):
+            try:
+                response = await self.sdk.with_options(
+                    max_retries=0
+                ).chat.completions.create(
+                    model=settings.ocr_model,
+                    messages=messages,
+                    temperature=0,
+                    max_tokens=settings.ocr_max_tokens,
+                    timeout=settings.ocr_timeout,
+                )
+                choice = response.choices[0]
+                if choice.finish_reason != "stop":
+                    raise OCRError(
+                        "OCR 输出未正常结束，可能截断；请检查 OCR_MAX_TOKENS"
+                    )
+                if not isinstance(choice.message.content, str):
+                    raise TypeError("Missing OCR text")
+                return parse_layout(choice.message.content)
+            except APIConnectionError:
+                error = OCRError("OCR 网络连接失败或超时")
+            except APIStatusError as exc:
+                error = OCRError(f"OCR HTTP {exc.status_code}")
+                if exc.status_code not in (408, 429) and exc.status_code < 500:
+                    raise error from None
+            except OCRError as exc:
+                error = exc
+            except (
+                APIResponseValidationError,
+                ValueError,
+                KeyError,
+                IndexError,
+                TypeError,
+                AttributeError,
+            ):
+                error = OCRError(
+                    "OCR 返回的布局 JSON 无效，请检查模型是否支持结构化识别"
+                )
+            if attempt == settings.ocr_retries:
+                raise error from None
+            # 指数退避期间交还事件循环，让其他页面继续处理。
+            await self.sleep(min(2**attempt, 8))
         raise AssertionError("unreachable")

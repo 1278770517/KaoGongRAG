@@ -10,3 +10,4 @@ __pycache__/
 output/
 .idea/
 *.pdf
+node_modules/
